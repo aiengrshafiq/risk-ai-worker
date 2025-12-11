@@ -9,6 +9,7 @@ from psycopg2 import extensions as psyext
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone   # <-- ADD THIS
+from decimal import Decimal
 
 import config as cfg
 
@@ -21,6 +22,28 @@ _LAST_CACHE_TIME = 0
 
 # NEW: global DB connection (reused per FC instance)
 _DB_CONN = None
+
+
+def _ms_to_iso(ms_value):
+    """
+    Convert millisecond epoch (BIGINT) to ISO8601 string in UTC.
+    """
+    try:
+        if ms_value is None:
+            return None
+        return datetime.fromtimestamp(int(ms_value) / 1000.0, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _int_to_bool(val):
+    if val is None:
+        return None
+    try:
+        return bool(int(val))
+    except Exception:
+        return None
+
 
 # ==========================
 # DB HELPERS
@@ -84,6 +107,298 @@ def dict_factory(cursor, row):
         d[col.name] = row[idx]
     return d
 
+def build_behavior_context(user_code, features):
+    """
+    Build richer behavior context for the AI agent.
+
+    Includes:
+      - user_profile: earliest device record (sign-up / first seen)
+      - login_activity_72h: last 72 hours login events from rt.user_device
+      - deposit_activity_24h: last 24 hours deposits from rt.deposit_record
+      - withdraw_activity_24h: last 24 hours withdrawals from rt.withdraw_record
+                               joined with rt.user_device via (user_code, request_id)
+      - trade_stats_24h: from rt.risk_features (already in `features`)
+    """
+    ctx = {
+        "user_profile": None,
+        "login_activity_72h": [],
+        "deposit_activity_24h": [],
+        "withdraw_activity_24h": [],
+        "trade_stats_24h": {},
+    }
+
+    # -------------------------------------------------
+    # 1) Trade stats from features (no DB call needed)
+    # -------------------------------------------------
+    try:
+        ctx["trade_stats_24h"] = {
+            "spot": {
+                "trade_count": features.get("spot_trade_count_24h"),
+                "trade_volume": features.get("spot_trade_volume_24h"),
+            },
+            "contract": {
+                "trade_count": features.get("contract_trade_count_24h"),
+                "trade_volume": features.get("contract_trade_volume_24h"),
+            },
+            "bot": {
+                "trade_count": features.get("bot_trade_count_24h"),
+                "trade_volume": features.get("bot_trade_volume_24h"),
+            },
+        }
+    except Exception as e:
+        print("[AI_WORKER] build_behavior_context trade_stats error:", e)
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        cur  = conn.cursor()
+
+        # -------------------------------------------------
+        # 2) User profile – earliest device record
+        # -------------------------------------------------
+        try:
+            cur.execute(
+                """
+                SELECT
+                    event_time,
+                    ip,
+                    country,
+                    city,
+                    is_vpn,
+                    is_proxy,
+                    is_bot,
+                    device,
+                    browser_info,
+                    visitor_id
+                FROM rt.user_device
+                WHERE user_code = %s
+                ORDER BY event_time ASC
+                LIMIT 1
+                """,
+                (str(user_code),),
+            )
+            row = cur.fetchone()
+            if row:
+                (
+                    event_time,
+                    ip,
+                    country,
+                    city,
+                    is_vpn,
+                    is_proxy,
+                    is_bot,
+                    device,
+                    browser_info,
+                    visitor_id,
+                ) = row
+
+                ctx["user_profile"] = {
+                    "first_seen_time": _ms_to_iso(event_time),
+                    "ip": ip,
+                    "country": country,
+                    "city": city,
+                    "is_vpn": _int_to_bool(is_vpn),
+                    "is_proxy": _int_to_bool(is_proxy),
+                    "is_bot": _int_to_bool(is_bot),
+                    "device": device,
+                    "browser_info": browser_info,
+                    "visitor_id": visitor_id,
+                }
+        except Exception as e:
+            print("[AI_WORKER] build_behavior_context profile error:", e)
+
+        # -------------------------------------------------
+        # 3) Last 72h login events (limit 20)
+        # -------------------------------------------------
+        try:
+            cur.execute(
+                """
+                SELECT
+                    event_time,
+                    ip,
+                    country,
+                    city,
+                    is_vpn,
+                    is_proxy,
+                    is_bot,
+                    device,
+                    browser_info,
+                    visitor_id
+                FROM rt.user_device
+                WHERE user_code = %s
+                  AND operation = 'login'
+                  AND to_timestamp(event_time / 1000.0) >= NOW() - INTERVAL '72 hours'
+                ORDER BY event_time DESC
+                LIMIT 20
+                """,
+                (str(user_code),),
+            )
+            rows = cur.fetchall()
+            login_list = []
+            for r in rows:
+                (
+                    event_time,
+                    ip,
+                    country,
+                    city,
+                    is_vpn,
+                    is_proxy,
+                    is_bot,
+                    device,
+                    browser_info,
+                    visitor_id,
+                ) = r
+                login_list.append(
+                    {
+                        "time": _ms_to_iso(event_time),
+                        "ip": ip,
+                        "country": country,
+                        "city": city,
+                        "is_vpn": _int_to_bool(is_vpn),
+                        "is_proxy": _int_to_bool(is_proxy),
+                        "is_bot": _int_to_bool(is_bot),
+                        "device": device,
+                        "browser_info": browser_info,
+                        "visitor_id": visitor_id,
+                    }
+                )
+            ctx["login_activity_72h"] = login_list
+        except Exception as e:
+            print("[AI_WORKER] build_behavior_context logins error:", e)
+
+        # -------------------------------------------------
+        # 4) Last 24h deposits (limit 20)
+        # -------------------------------------------------
+        try:
+            cur.execute(
+                """
+                SELECT
+                    create_at,
+                    recharge_currency,
+                    chain,
+                    recharge_amount,
+                    status
+                FROM rt.deposit_record
+                WHERE user_code = %s
+                  AND create_at BETWEEN
+                        (EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours') * 1000)::BIGINT
+                    AND (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
+                ORDER BY create_at DESC
+                LIMIT 20
+                """,
+                (str(user_code),),
+            )
+            rows = cur.fetchall()
+            dep_list = []
+            for r in rows:
+                create_at, token, network, amount, status = r
+                # amount may be Decimal
+                if isinstance(amount, Decimal):
+                    amount_str = str(amount)
+                else:
+                    amount_str = str(amount) if amount is not None else None
+                dep_list.append(
+                    {
+                        "time": _ms_to_iso(create_at),
+                        "token": token,
+                        "network": network,
+                        "amount": amount_str,
+                        "status": status,
+                    }
+                )
+            ctx["deposit_activity_24h"] = dep_list
+        except Exception as e:
+            print("[AI_WORKER] build_behavior_context deposits error:", e)
+
+        # -------------------------------------------------
+        # 5) Last 24h withdrawals + device join (limit 20)
+        #    Join rt.withdraw_record with rt.user_device on (user_code, request_id)
+        # -------------------------------------------------
+        try:
+            cur.execute(
+                """
+                SELECT
+                    w.create_at,
+                    w.withdraw_currency,
+                    w.chain,
+                    w.withdraw_amount,
+                    w.status,
+                    w.request_id,
+                    ud.ip,
+                    ud.country,
+                    ud.city,
+                    ud.is_vpn,
+                    ud.is_proxy,
+                    ud.is_bot,
+                    ud.device,
+                    ud.browser_info,
+                    ud.visitor_id
+                FROM rt.withdraw_record w
+                LEFT JOIN rt.user_device ud
+                  ON ud.user_code  = w.user_code
+                 AND ud.request_id = w.request_id
+                WHERE w.user_code = %s
+                  AND w.create_at BETWEEN
+                        (EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours') * 1000)::BIGINT
+                    AND (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
+                ORDER BY w.create_at DESC
+                LIMIT 20
+                """,
+                (str(user_code),),
+            )
+            rows = cur.fetchall()
+            wd_list = []
+            for r in rows:
+                (
+                    create_at,
+                    token,
+                    network,
+                    amount,
+                    status,
+                    request_id,
+                    ip,
+                    country,
+                    city,
+                    is_vpn,
+                    is_proxy,
+                    is_bot,
+                    device,
+                    browser_info,
+                    visitor_id,
+                ) = r
+
+                if isinstance(amount, Decimal):
+                    amount_str = str(amount)
+                else:
+                    amount_str = str(amount) if amount is not None else None
+
+                wd_list.append(
+                    {
+                        "time": _ms_to_iso(create_at),
+                        "token": token,
+                        "network": network,
+                        "amount": amount_str,
+                        "status": status,
+                        "request_id": request_id,
+                        "ip": ip,
+                        "country": country,
+                        "city": city,
+                        "is_vpn": _int_to_bool(is_vpn),
+                        "is_proxy": _int_to_bool(is_proxy),
+                        "is_bot": _int_to_bool(is_bot),
+                        "device": device,
+                        "browser_info": browser_info,
+                        "visitor_id": visitor_id,
+                    }
+                )
+            ctx["withdraw_activity_24h"] = wd_list
+        except Exception as e:
+            print("[AI_WORKER] build_behavior_context withdrawals error:", e)
+
+    except Exception as e:
+        print("[AI_WORKER] build_behavior_context DB Error:", e)
+
+    return ctx
 
 def fetch_risk_features(user_code, txn_id):
     """
@@ -387,7 +702,7 @@ def evaluate_fixed_rules(features, rules):
 # ==========================
 # AI AGENT
 # ==========================
-def call_gemini_reasoning_rest(features, rule_context=None):
+def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=None):
     """
     Phase-2 AI Agent.
 
@@ -414,6 +729,7 @@ def call_gemini_reasoning_rest(features, rule_context=None):
                 "rule_name": (rule_context or {}).get("rule_name"),
                 "rule_narrative": (rule_context or {}).get("narrative"),
             },
+            "behavior_context": behavior_context or {},
         }
 
         case_str         = json.dumps(case_payload, default=str)

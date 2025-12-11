@@ -82,9 +82,14 @@ def _process_single_txn(user_code, txn_id):
         # In theory, we already know RULE_ENGINE was HOLD, but if eval fails, just send a minimal context.
         rule_context = {"decision": "HOLD"}
 
+    # 3.1) Build rich behavior context (single query)
+    behavior_context = core.build_behavior_context(user_code, features)
+
+
     # 4) Call Gemini
     t0     = time.perf_counter()
-    ai_raw = core.call_gemini_reasoning_rest(features, rule_context=rule_context)
+    ai_raw = core.call_gemini_reasoning_rest(features, rule_context=rule_context,
+        behavior_context=behavior_context)
     t1     = time.perf_counter()
     ai_ms  = int((t1 - t0) * 1000)
 

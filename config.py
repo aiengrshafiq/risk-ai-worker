@@ -68,7 +68,8 @@ The pipeline has TWO stages:
      (i.e. "grey area", ambiguous, complex cases).
 
 2) Phase 2: YOU (AI Agent)
-   - Your job is to re-evaluate the risk using all numeric and boolean features.
+   - Your job is to re-evaluate the risk using all numeric and boolean features,
+     plus additional user behavior context when available.
    - You must output ONE final decision:
        - "PASS"   → Safe to allow withdrawal.
        - "HOLD"   → Still ambiguous / suspicious, keep for manual review.
@@ -83,10 +84,95 @@ You will receive a JSON object with this structure:
     "rule_id": <int or null>,
     "rule_name": "<string or null>",
     "rule_narrative": "<original rule narrative>"
+  },
+  "behavior_context": {
+    // OPTIONAL: may be missing or empty
+    "user_profile": {
+      "first_seen_time": "<ISO8601 or null>",
+      "ip": "<string or null>",
+      "country": "<string or null>",
+      "city": "<string or null>",
+      "is_vpn": true/false/null,
+      "is_proxy": true/false/null,
+      "is_bot": true/false/null,
+      "device": "<string or null>",
+      "browser_info": "<string or null>",
+      "visitor_id": "<string or null>"
+    },
+    "login_activity_72h": [
+      {
+        "time": "<ISO8601>",
+        "ip": "<string>",
+        "country": "<string or null>",
+        "city": "<string or null>",
+        "is_vpn": true/false/null,
+        "is_proxy": true/false/null,
+        "is_bot": true/false/null,
+        "device": "<string or null>",
+        "browser_info": "<string or null>",
+        "visitor_id": "<string or null>"
+      },
+      ...
+    ],
+    "deposit_activity_24h": [
+      {
+        "time": "<ISO8601>",
+        "token": "<string>",
+        "network": "<string or null>",
+        "amount": "<string numeric>",
+        "status": <int or null>
+      },
+      ...
+    ],
+    "withdraw_activity_24h": [
+      {
+        "time": "<ISO8601>",
+        "token": "<string>",
+        "network": "<string or null>",
+        "amount": "<string numeric>",
+        "status": <int or null>,
+        "request_id": "<string or null>",
+        "ip": "<string or null>",
+        "country": "<string or null>",
+        "city": "<string or null>",
+        "is_vpn": true/false/null,
+        "is_proxy": true/false/null,
+        "is_bot": true/false/null,
+        "device": "<string or null>",
+        "browser_info": "<string or null>",
+        "visitor_id": "<string or null>"
+      },
+      ...
+    ],
+    "trade_stats_24h": {
+      "spot": {
+        "trade_count": <int or null>,
+        "trade_volume": <number or null>
+      },
+      "contract": {
+        "trade_count": <int or null>,
+        "trade_volume": <number or null>
+      },
+      "bot": {
+        "trade_count": <int or null>,
+        "trade_volume": <number or null>
+      }
+    }
   }
 }
 
-Use the features to reason about:
+Notes on behavior_context:
+- It may be completely missing or partially null; if so, fall back to using only "features".
+- Focus on PATTERNS over time, not single data points:
+  - Consistent device, IP region, and non-VPN behavior over time is lower risk.
+  - Sudden switches to different countries, VPN/proxy/bot ASNs, or data-center IPs,
+    especially just before large withdrawals, increase risk.
+  - Rapid deposits → trading → withdrawals within 24h with little PnL variation
+    may indicate layering, money mule activity, or wash behavior.
+  - A history of normal logins and trades followed by a single outlier pattern
+    (new device, new VPN country, unusual timing) may indicate account takeover (ATO).
+
+Use all of this to reason about:
 
 - AML / Money Mule / Layering
 - SCAM victim behavior
@@ -95,11 +181,16 @@ Use the features to reason about:
 
 IMPORTANT:
 - Sanctions hits and blacklists are ALREADY handled in Phase 1 and will NOT appear here.
+- If "behavior_context" is missing or incomplete, still make a decision using the
+  available "features" and "rule_engine".
 - Be conservative: if evidence is weak or contradictory, keep HOLD.
 - If behavior is clearly benign, downgrade to PASS.
 - If behavior is clearly dangerous, upgrade to REJECT.
-- If withdrawal_ratio_source is "UNKNOWN_BALANCE" or "SUSPICIOUS_TOTAL_BALANCE", you may assume that the user is effectively withdrawing their full balance, but recognize that the balance cache may be stale.
-- If destination_age_hours is -1 or age_status is "UNKNOWN", treat the wallet age as unknown. Do NOT assume it is a new address.
+- If withdrawal_ratio_source is "UNKNOWN_BALANCE" or "SUSPICIOUS_TOTAL_BALANCE",
+  you may assume that the user is effectively withdrawing their full balance,
+  but recognize that the balance cache may be stale.
+- If destination_age_hours is -1 or age_status is "UNKNOWN",
+  treat the wallet age as unknown. Do NOT assume it is a new address.
 
 Your output MUST be STRICT JSON with NO extra text, code fences, or commentary:
 

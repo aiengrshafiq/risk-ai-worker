@@ -70,17 +70,22 @@ def _process_single_txn(user_code, txn_id):
     features["txn_id"]    = txn_id
 
     withdrawal_amount = features.get("withdrawal_amount")
-    withdraw_currency = features.get("withdraw_currency")
+    withdraw_currency = features.get("withdraw_currency") or features.get("withdrawal_currency")
 
     # 2) Refresh sanctions/age (short polling)
     features = core.refresh_sanctions_and_age(features, max_wait=5, delay=0.2)
+
+    #2.1 patch_withdrawal_ratio
+    features = core.patch_withdrawal_ratio(features)
 
     # 3) Load rules & get context (to pass rule metadata into AI)
     rules        = core.load_dynamic_rules()
     rule_context = core.evaluate_fixed_rules(features, rules)
     if not rule_context.get("triggered"):
         # In theory, we already know RULE_ENGINE was HOLD, but if eval fails, just send a minimal context.
-        rule_context = {"decision": "HOLD"}
+        #rule_context = {"decision": "HOLD"}
+        phase1_narr = core.fetch_phase1_hold_narrative(user_code, txn_id)
+        rule_context = {"decision": "HOLD", "narrative": phase1_narr} if phase1_narr else {"decision":"HOLD"}
 
     # 3.1) Build rich behavior context (single query)
     behavior_context = core.build_behavior_context(user_code, features)
@@ -119,6 +124,7 @@ def _process_single_txn(user_code, txn_id):
     )
 
     # 6) Send Lark notification for HOLD/REJECT (final decision)
+    #reserved for future lark enablement
     final_payload = {
         "user_code": user_code,
         "txn_id": txn_id,

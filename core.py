@@ -449,6 +449,8 @@ def patch_withdrawal_ratio(features):
         return features
 
     features["withdrawal_ratio_source"] = "BALANCE_CACHE"
+    if ratio is not None:
+        features["withdrawal_ratio"] = ratio
     return features
 
 def refresh_sanctions_and_age(features, max_wait=5, delay=0.2):
@@ -692,12 +694,47 @@ def evaluate_fixed_rules(features, rules):
                     # NEW: pass rule metadata to AI
                     "rule_id": rule.get("rule_id"),
                     "rule_name": rule.get("rule_name"),
+                    "rule_logic": logic,
                 }
         except Exception as exc:
             print(f"[RISK_FC] Error evaluating rule '{rule.get('rule_name')}': {exc}")
             continue
     return {"triggered": False}
 
+
+def fetch_phase1_hold_narrative(user_code, txn_id):
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT narrative
+            FROM rt.risk_withdraw_decision
+            WHERE user_code=%s AND txn_id=%s
+              AND decision_source='RULE_ENGINE_RULES'
+              AND decision='HOLD'
+            ORDER BY decision_timestamp DESC
+            LIMIT 1
+        """, (str(user_code), str(txn_id)))
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else None
+    except Exception as e:
+        print("[AI_WORKER] fetch_phase1_hold_narrative error:", e)
+        return None
+
+def _extract_json_object(text: str):
+    if not text:
+        return None
+    text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    candidate = text[start:end+1]
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
 
 # ==========================
 # AI AGENT
@@ -728,6 +765,7 @@ def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=Non
                 "rule_id": (rule_context or {}).get("rule_id"),
                 "rule_name": (rule_context or {}).get("rule_name"),
                 "rule_narrative": (rule_context or {}).get("narrative"),
+                "rule_logic": (rule_context or {}).get("rule_logic"),
             },
             "behavior_context": behavior_context or {},
         }
@@ -765,13 +803,10 @@ def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=Non
                         .get("parts", [])[0]
                         .get("text", "")
                     )
-                    clean_text = (
-                        raw_text.strip()
-                        .replace("```json", "")
-                        .replace("```", "")
-                        .strip()
-                    )
-                    ai_obj = json.loads(clean_text)
+                    
+                    ai_obj = _extract_json_object(raw_text)
+                    if not ai_obj:
+                        raise ValueError("Gemini returned non-JSON")
 
                     final_decision = ai_obj.get("final_decision", "HOLD")
                     primary_threat = ai_obj.get("primary_threat", "NONE")
@@ -779,6 +814,18 @@ def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=Non
                     confidence     = float(ai_obj.get("confidence", 0.7) or 0.7)
                     narrative      = ai_obj.get("narrative", "AI evaluation.")
                     rule_alignment = ai_obj.get("rule_alignment", "AGREES_WITH_RULE")
+                    rule_alignment = rule_alignment if rule_alignment in (
+                        "AGREES_WITH_RULE", "OVERRIDES_TO_PASS", "OVERRIDES_TO_REJECT"
+                    ) else "AGREES_WITH_RULE"
+                    
+
+                    # normalize
+                    final_decision = final_decision if final_decision in ("PASS","HOLD","REJECT") else "HOLD"
+                    primary_threat = primary_threat if primary_threat in ("AML","SCAM","ATO","INTEGRITY","NONE") else "NONE"
+
+                    # clamp
+                    risk_score = max(0, min(100, risk_score))
+                    confidence = max(0.0, min(1.0, confidence))
 
                     return {
                         "final_decision": final_decision,

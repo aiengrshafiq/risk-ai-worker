@@ -103,6 +103,13 @@ def _process_single_txn(user_code, txn_id):
     final_risk_score    = ai_raw.get("risk_score", 0)
     final_confidence    = ai_raw.get("confidence", 0.7)
     final_narrative     = ai_raw.get("narrative", "AI evaluation.")
+    # NEW: Extract Chain of Thought for detailed auditing
+    chain_of_thought_list = ai_raw.get("chain_of_thought", [])
+    if isinstance(chain_of_thought_list, list):
+        # Join list into a readable paragraph for the DB text column
+        llm_reasoning_str = "\n".join(chain_of_thought_list)
+    else:
+        llm_reasoning_str = str(chain_of_thought_list)
 
     # 5) Log AI decision into rt.risk_withdraw_decision
     ai_source = "AI_AGENT_REVIEW"
@@ -112,6 +119,7 @@ def _process_single_txn(user_code, txn_id):
         "risk_score": final_risk_score,
         "confidence": final_confidence,
         "narrative": final_narrative,
+        "llm_reasoning": llm_reasoning_str  # Full audit trail
     }
 
     core.log_decision_to_db(

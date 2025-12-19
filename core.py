@@ -629,7 +629,7 @@ def log_decision_to_db(
         decision      = result.get("decision", "HOLD")
         threat        = result.get("primary_threat", "UNKNOWN")
         narrative     = result.get("narrative", "")
-        llm_reasoning = narrative
+        llm_reasoning = result.get("llm_reasoning", narrative)
 
         # Prefer explicit confidence if provided, else derive from risk_score
         if "confidence" in result:

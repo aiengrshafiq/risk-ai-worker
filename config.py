@@ -46,8 +46,9 @@ SANCTIONS_CACHE_TTL  = int(os.environ.get("SANCTIONS_CACHE_TTL", "3600"))      #
 DEST_AGE_CACHE_TTL   = int(os.environ.get("DEST_AGE_CACHE_TTL", "21600"))     # 6 hours
 RULE_CACHE_TTL      = 300         # 5 minutes
 
+
 # -----------------------------
-# Comprehensive Reasoning Prompt
+# Comprehensive Reasoning Prompt (Final Production v1.1)
 # -----------------------------
 COMPREHENSIVE_REASONING_PROMPT = """
 You are the Phase 2 Risk AI Agent for OneBullEx.
@@ -114,9 +115,15 @@ Choose ONE: AML / SCAM / ATO / INTEGRITY / NONE
 DATA QUALITY CAUTION:
 - If withdrawal_ratio_source is UNKNOWN_BALANCE or SUSPICIOUS_TOTAL_BALANCE, treat as full-drain risk but mention cache uncertainty.
 - If destination_age_hours is -1 or age_status is UNKNOWN, treat destination age as unknown (do not assume new).
+- SCORING MISSING DATA: If a critical numeric feature is -1 or None (e.g. destination_age_hours, sanctions_status), score that specific sub-dimension as 50 (Medium Risk) to ensure a HOLD, UNLESS strong evidence elsewhere confirms safety or risk.
 
 OUTPUT (STRICT JSON ONLY):
 {
+   "reasoning_steps": [
+     "Step 1: Analyze Rule Alignment...",
+     "Step 2: Check ATO signals...",
+     "Step 3: Check AML patterns..."
+  ],
   "final_decision": "PASS" | "HOLD" | "REJECT",
   "primary_threat": "AML" | "SCAM" | "ATO" | "INTEGRITY" | "NONE",
   "risk_score": <integer 0-100>,
@@ -132,5 +139,4 @@ Narrative format requirement (keep it compact but auditable):
 - 4th sentence (optional): final decision justification
 
 DO NOT output anything except the JSON object.
-
 """

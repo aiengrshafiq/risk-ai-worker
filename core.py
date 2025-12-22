@@ -629,7 +629,7 @@ def log_decision_to_db(
         decision      = result.get("decision", "HOLD")
         threat        = result.get("primary_threat", "UNKNOWN")
         narrative     = result.get("narrative", "")
-        llm_reasoning = result.get("llm_reasoning", narrative)
+        llm_reasoning = result.get("llm_reasoning") or narrative
 
         # Prefer explicit confidence if provided, else derive from risk_score
         if "confidence" in result:
@@ -742,10 +742,7 @@ def _extract_json_object(text: str):
 def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=None):
     """
     Phase-2 AI Agent.
-
-    Uses a fast Gemini model (e.g. gemini-2.5-flash) with:
-    - Fewer retries
-    - Shorter timeout
+    Uses a fast Gemini model (e.g. gemini-2.5-flash) with robust timeouts.
     """
     if not cfg.GEMINI_API_KEY:
         return {
@@ -755,6 +752,7 @@ def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=Non
             "confidence": 0.5,
             "narrative": "AI config missing. Keeping HOLD for manual review.",
             "rule_alignment": "AGREES_WITH_RULE",
+            "reasoning_steps": []  # Always return list
         }
 
     try:
@@ -783,13 +781,17 @@ def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=Non
             api_url, data=data, headers={"Content-Type": "application/json"}
         )
 
-        # Reduced retries and timeout for latency
+        # RETRY LOGIC (3 attempts)
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(req, timeout=30) as response:
+                # INCREASE TIMEOUT TO 120s for Pro model
+                with urllib.request.urlopen(req, timeout=120) as response:
                     if response.status != 200:
                         print(f"[RISK_FC] Gemini HTTP status {response.status}")
-                        break
+                        if 500 <= response.status < 600: # Server error, retry
+                            time.sleep(1)
+                            continue
+                        break # Client error, stop
 
                     resp_json  = json.loads(response.read().decode("utf-8"))
                     candidates = resp_json.get("candidates", [])
@@ -806,24 +808,28 @@ def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=Non
                     
                     ai_obj = _extract_json_object(raw_text)
                     if not ai_obj:
-                        raise ValueError("Gemini returned non-JSON")
+                        print("[RISK_FC] Gemini returned invalid JSON")
+                        break
 
+                    # Success! Parse fields
                     final_decision = ai_obj.get("final_decision", "HOLD")
                     primary_threat = ai_obj.get("primary_threat", "NONE")
                     risk_score     = int(ai_obj.get("risk_score", 0) or 0)
                     confidence     = float(ai_obj.get("confidence", 0.7) or 0.7)
                     narrative      = ai_obj.get("narrative", "AI evaluation.")
-                    rule_alignment = ai_obj.get("rule_alignment", "AGREES_WITH_RULE")
-                    rule_alignment = rule_alignment if rule_alignment in (
-                        "AGREES_WITH_RULE", "OVERRIDES_TO_PASS", "OVERRIDES_TO_REJECT"
-                    ) else "AGREES_WITH_RULE"
                     
+                    # [CRITICAL FIX] Capture reasoning_steps from AI response
+                    reasoning_steps = ai_obj.get("reasoning_steps", [])
+                    if not isinstance(reasoning_steps, list):
+                        reasoning_steps = [str(reasoning_steps)] if reasoning_steps else []
+                    
+                    rule_alignment = ai_obj.get("rule_alignment", "AGREES_WITH_RULE")
+                    if rule_alignment not in ("AGREES_WITH_RULE", "OVERRIDES_TO_PASS", "OVERRIDES_TO_REJECT"):
+                        rule_alignment = "AGREES_WITH_RULE"
 
-                    # normalize
+                    # Normalize
                     final_decision = final_decision if final_decision in ("PASS","HOLD","REJECT") else "HOLD"
                     primary_threat = primary_threat if primary_threat in ("AML","SCAM","ATO","INTEGRITY","NONE") else "NONE"
-
-                    # clamp
                     risk_score = max(0, min(100, risk_score))
                     confidence = max(0.0, min(1.0, confidence))
 
@@ -833,24 +839,31 @@ def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=Non
                         "risk_score": risk_score,
                         "confidence": confidence,
                         "narrative": narrative,
+                        "reasoning_steps": reasoning_steps, # [CRITICAL FIX] Return this!
                         "rule_alignment": rule_alignment,
                     }
+
             except urllib.error.HTTPError as e:
                 print(f"[RISK_FC] HTTP Error (Gemini): {e.code}")
-                time.sleep(0.5)
+                if 500 <= e.code < 600:
+                    time.sleep(1)
+                    continue
+                break
             except Exception as e:
                 print(f"[RISK_FC] Gemini error attempt {attempt+1}: {e}")
-                time.sleep(0.5)
+                time.sleep(1) # Wait before retry
 
-        # Fallback if all attempts fail or JSON is bad
+        # Fallback if all attempts fail
         return {
             "final_decision": "HOLD",
             "primary_threat": "AI_NET_ERR",
             "risk_score": -1,
             "confidence": 0.5,
-            "narrative": "AI unavailable or invalid response. Keeping HOLD for manual review.",
+            "narrative": "AI unavailable (Timeout/Network). Keeping HOLD for manual review.",
             "rule_alignment": "AGREES_WITH_RULE",
+            "reasoning_steps": []
         }
+
     except Exception as exc:
         print(f"[RISK_FC] Gemini fatal error: {exc}")
         return {
@@ -860,6 +873,5 @@ def call_gemini_reasoning_rest(features, rule_context=None, behavior_context=Non
             "confidence": 0.5,
             "narrative": f"AI exception: {str(exc)}",
             "rule_alignment": "AGREES_WITH_RULE",
+            "reasoning_steps": []
         }
-
-

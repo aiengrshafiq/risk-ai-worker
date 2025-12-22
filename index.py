@@ -104,7 +104,7 @@ def _process_single_txn(user_code, txn_id):
     final_confidence    = ai_raw.get("confidence", 0.7)
     final_narrative     = ai_raw.get("narrative", "AI evaluation.")
     # NEW: Extract Chain of Thought for detailed auditing
-    chain_of_thought_list = ai_raw.get("chain_of_thought", [])
+    chain_of_thought_list = ai_raw.get("reasoning_steps", [])
     if isinstance(chain_of_thought_list, list):
         # Join list into a readable paragraph for the DB text column
         llm_reasoning_str = "\n".join(chain_of_thought_list)
